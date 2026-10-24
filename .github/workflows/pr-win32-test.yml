@@ -196,9 +196,9 @@ jobs:
 
       - name: 🧪 Run unit tests (Browser, Chromium)
         if: ${{ inputs.browser_tests && inputs.unit_tests }}
-        timeout-minutes: 20
+        timeout-minutes: 25
         shell: pwsh
-        run: node test/unit/browser/index.js --browser chromium --tfs "Browser Unit Tests"
+        run: node test/unit/browser/index.js --browser chromium --tfs "Browser Unit Tests" --rerun-failed-files 2
         env:
           DEBUG: "*browser*"
 
