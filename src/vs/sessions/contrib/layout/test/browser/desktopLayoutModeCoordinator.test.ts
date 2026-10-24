@@ -12,11 +12,13 @@ import { mock } from '../../../../../base/test/common/mock.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { CommandsRegistry } from '../../../../../platform/commands/common/commands.js';
 import { ContextKeyValue } from '../../../../../platform/contextkey/common/contextkey.js';
+import { Parts } from '../../../../../workbench/services/layout/browser/layoutService.js';
 import { ChatLayoutMode } from '../../../../common/chatLayout.js';
 import { SESSION_ACTIVITY_BAR_LAYOUT_ACTIONS_SETTING, SESSION_ACTIVITY_BAR_SETTING } from '../../../../common/sessionConfig.js';
 import { SessionLayoutMode } from '../../../../common/sessionLayoutMode.js';
 import { IChatWindow } from '../../../../services/chatWindow/browser/chatWindowService.js';
 import { LayoutModeOwnerKind } from '../../../../services/layoutMode/common/sessionLayoutModeService.js';
+import { SessionStatus } from '../../../../services/sessions/common/session.js';
 import { IActiveSession } from '../../../../services/sessions/common/sessionsManagement.js';
 import { DesktopLayoutController } from '../../browser/desktopLayoutController.js';
 import { DesktopLayoutModeCoordinator, MAIN_WINDOW_LAYOUT_TOGGLE_COMMAND_IDS } from '../../browser/desktop/desktopLayoutModeCoordinator.js';
@@ -43,8 +45,8 @@ suite('Sessions - DesktopLayoutModeCoordinator', () => {
 		}
 	}
 
-	function createController(chatLayoutMode: ChatLayoutMode, initialSession: IActiveSession): TestDesktopController {
-		harness = createTestHarness(store, { desktopLayout: true, chatLayoutMode, workspaceFolders: [{ uri: URI.file('/repo') }] });
+	function createController(chatLayoutMode: ChatLayoutMode, initialSession: IActiveSession, workspaceFolder = URI.file('/repo')): TestDesktopController {
+		harness = createTestHarness(store, { desktopLayout: true, chatLayoutMode, workspaceFolders: [{ uri: workspaceFolder }] });
 		harness.activeSessionObs.set(initialSession, undefined);
 		return store.add(harness.instaService.createInstance(TestDesktopController));
 	}
@@ -55,6 +57,7 @@ suite('Sessions - DesktopLayoutModeCoordinator', () => {
 			context: harness.contextKeyService.getContextKeyValue('sessions.layoutMode'),
 			arrangement: harness.sidePaneArrangement,
 			maximized: harness.editorMaximized,
+			chatHidden: harness.partVisibility.get(Parts.SESSIONS_PART) === false,
 		};
 	}
 
@@ -88,40 +91,78 @@ suite('Sessions - DesktopLayoutModeCoordinator', () => {
 			const backToB = state(controller);
 
 			const expectedA = scope === 'chat'
-				? { mode: SessionLayoutMode.Stacked, context: SessionLayoutMode.Stacked, arrangement: SessionLayoutMode.Stacked, maximized: false }
-				: { mode: SessionLayoutMode.EditorOnly, context: SessionLayoutMode.EditorOnly, arrangement: SessionLayoutMode.SideBySide, maximized: true };
+				? { mode: SessionLayoutMode.Stacked, context: SessionLayoutMode.Stacked, arrangement: SessionLayoutMode.Stacked, maximized: false, chatHidden: false }
+				: { mode: SessionLayoutMode.EditorOnly, context: SessionLayoutMode.EditorOnly, arrangement: SessionLayoutMode.SideBySide, maximized: false, chatHidden: true };
 			assert.deepStrictEqual({ stackedA, focusedB, editorOnlyB, backToA, backToB }, {
-				stackedA: { mode: SessionLayoutMode.Stacked, context: SessionLayoutMode.Stacked, arrangement: SessionLayoutMode.Stacked, maximized: false },
+				stackedA: { mode: SessionLayoutMode.Stacked, context: SessionLayoutMode.Stacked, arrangement: SessionLayoutMode.Stacked, maximized: false, chatHidden: false },
 				// An unvisited chat keeps what the window shows.
-				focusedB: { mode: SessionLayoutMode.Stacked, context: SessionLayoutMode.Stacked, arrangement: SessionLayoutMode.Stacked, maximized: false },
-				editorOnlyB: { mode: SessionLayoutMode.EditorOnly, context: SessionLayoutMode.EditorOnly, arrangement: SessionLayoutMode.SideBySide, maximized: true },
+				focusedB: { mode: SessionLayoutMode.Stacked, context: SessionLayoutMode.Stacked, arrangement: SessionLayoutMode.Stacked, maximized: false, chatHidden: false },
+				editorOnlyB: { mode: SessionLayoutMode.EditorOnly, context: SessionLayoutMode.EditorOnly, arrangement: SessionLayoutMode.SideBySide, maximized: false, chatHidden: true },
 				backToA: expectedA,
-				backToB: { mode: SessionLayoutMode.EditorOnly, context: SessionLayoutMode.EditorOnly, arrangement: SessionLayoutMode.SideBySide, maximized: true },
+				backToB: { mode: SessionLayoutMode.EditorOnly, context: SessionLayoutMode.EditorOnly, arrangement: SessionLayoutMode.SideBySide, maximized: false, chatHidden: true },
 			});
 		});
 	}
 
-	test('un-maximizes synchronously as focus moves from a chat in editor only to one that is not, before its side pane is restored', async () => {
+	test('shows the chat synchronously as focus moves from a chat in editor only to one that is not, before its side pane is restored', async () => {
 		const controller = createController('chat', sessionA);
 		await controller.whenRestored();
 		await focus(controller, sessionB);
 		controller.layoutMode.setMode(SessionLayoutMode.SideBySide);
 		await focus(controller, sessionA);
 		controller.layoutMode.setMode(SessionLayoutMode.EditorOnly);
-		const maximizedA = state(controller);
+		const editorOnlyA = state(controller);
 		harness.executedCommands.length = 0;
 
 		// Synchronously within the focus change: a command could run later, once its activation event has run.
 		harness.activeSessionObs.set(sessionB, undefined);
-		const synchronously = { maximized: harness.editorMaximized, commands: [...harness.executedCommands] };
+		const synchronously = { chatHidden: harness.partVisibility.get(Parts.SESSIONS_PART) === false, commands: [...harness.executedCommands] };
 		await controller.whenRestored();
 
-		assert.deepStrictEqual({ maximizedA, synchronously, focusedB: state(controller) }, {
-			maximizedA: { mode: SessionLayoutMode.EditorOnly, context: SessionLayoutMode.EditorOnly, arrangement: SessionLayoutMode.SideBySide, maximized: true },
-			synchronously: { maximized: false, commands: [] },
-			focusedB: { mode: SessionLayoutMode.SideBySide, context: SessionLayoutMode.SideBySide, arrangement: SessionLayoutMode.SideBySide, maximized: false },
+		assert.deepStrictEqual({ editorOnlyA, synchronously, focusedB: state(controller) }, {
+			editorOnlyA: { mode: SessionLayoutMode.EditorOnly, context: SessionLayoutMode.EditorOnly, arrangement: SessionLayoutMode.SideBySide, maximized: false, chatHidden: true },
+			synchronously: { chatHidden: false, commands: [] },
+			focusedB: { mode: SessionLayoutMode.SideBySide, context: SessionLayoutMode.SideBySide, arrangement: SessionLayoutMode.SideBySide, maximized: false, chatHidden: false },
 		});
 	});
+
+	for (const scope of ['session-shared', 'chat'] as const) {
+		test(`restores a remembered editor only into a closed side pane with the focused chat's own side pane, which stays remembered, as ${scope} scopes it`, async () => {
+			const draft = makeSession(URI.parse('test:/draft'), { status: SessionStatus.Untitled, isCreated: false });
+			// The window's folder is not the sessions' yet, as while a session's workspace hydrates, so no editor working set
+			// restore is under way as the focus changes.
+			const controller = createController(scope, sessionB, URI.file('/other'));
+			await controller.whenRestored();
+			const sidePane = () => ({
+				...state(controller),
+				editor: harness.partVisibility.get(Parts.EDITOR_PART) ?? true,
+				details: harness.partVisibility.get(Parts.AUXILIARYBAR_PART) ?? true,
+			});
+
+			// B shows Details only, then editor only.
+			harness.layoutService.setPartHidden(false, Parts.AUXILIARYBAR_PART);
+			harness.layoutService.setPartHidden(true, Parts.EDITOR_PART);
+			controller.layoutMode.setMode(SessionLayoutMode.EditorOnly);
+			const editorOnlyB = sidePane();
+			// A draft in chat only closes the side pane.
+			await focus(controller, draft);
+			controller.layoutMode.setMode(SessionLayoutMode.ChatOnly);
+			const chatOnlyDraft = sidePane();
+			await focus(controller, sessionB);
+			const backToB = sidePane();
+			await focus(controller, draft);
+			await focus(controller, sessionB);
+			const againB = sidePane();
+
+			const detailsOnly = { mode: SessionLayoutMode.EditorOnly, context: SessionLayoutMode.EditorOnly, arrangement: SessionLayoutMode.SideBySide, maximized: false, chatHidden: true, editor: false, details: true };
+			assert.deepStrictEqual({ editorOnlyB, chatOnlyDraft, backToB, againB }, {
+				editorOnlyB: detailsOnly,
+				chatOnlyDraft: { mode: SessionLayoutMode.ChatOnly, context: SessionLayoutMode.ChatOnly, arrangement: SessionLayoutMode.SideBySide, maximized: false, chatHidden: false, editor: false, details: false },
+				backToB: detailsOnly,
+				againB: detailsOnly,
+			});
+		});
+	}
 
 	test('leads the session activity bar of the main window with one Layout button of the same icon in every mode, opening Show Chat, Show Editor and Stacked as the window shows them, while it shows its layout actions', async () => {
 		const controller = createController('chat', sessionA);
@@ -200,7 +241,101 @@ suite('Sessions - DesktopLayoutModeCoordinator', () => {
 		]);
 	});
 
-	test('shows each mode through the existing side pane and maximize operations', async () => {
+	test('editor only hides only the chat, keeping the sessions list and the panel, and show chat brings it back as it last showed with the editor', async () => {
+		const controller = createController('chat', sessionA);
+		await controller.whenRestored();
+		harness.partVisibility.set(Parts.SIDEBAR_PART, true);
+		harness.partVisibility.set(Parts.PANEL_PART, true);
+		controller.layoutMode.setMode(SessionLayoutMode.Stacked);
+		harness.setEditorMaximizedCalls.length = 0;
+		const parts = () => ({ ...state(controller), sidebar: harness.partVisibility.get(Parts.SIDEBAR_PART), panel: harness.partVisibility.get(Parts.PANEL_PART), editor: harness.partVisibility.get(Parts.EDITOR_PART) });
+
+		await harness.instaService.invokeFunction(accessor => CommandsRegistry.getCommand(MAIN_WINDOW_LAYOUT_TOGGLE_COMMAND_IDS.chat)!.handler(accessor));
+		const chatHidden = parts();
+		await harness.instaService.invokeFunction(accessor => CommandsRegistry.getCommand(MAIN_WINDOW_LAYOUT_TOGGLE_COMMAND_IDS.chat)!.handler(accessor));
+		const chatShown = parts();
+		// The Maximize Editor Area action stays a thing of its own; the menu reads it as editor only, and show chat restores it.
+		harness.layoutService.setEditorMaximized(true);
+		const maximized = state(controller);
+		await harness.instaService.invokeFunction(accessor => CommandsRegistry.getCommand(MAIN_WINDOW_LAYOUT_TOGGLE_COMMAND_IDS.chat)!.handler(accessor));
+
+		assert.deepStrictEqual({ chatHidden, chatShown, maximized, afterShowChat: state(controller), maximizeCalls: harness.setEditorMaximizedCalls }, {
+			chatHidden: { mode: SessionLayoutMode.EditorOnly, context: SessionLayoutMode.EditorOnly, arrangement: SessionLayoutMode.Stacked, maximized: false, chatHidden: true, sidebar: true, panel: true, editor: true },
+			chatShown: { mode: SessionLayoutMode.Stacked, context: SessionLayoutMode.Stacked, arrangement: SessionLayoutMode.Stacked, maximized: false, chatHidden: false, sidebar: true, panel: true, editor: true },
+			maximized: { mode: SessionLayoutMode.EditorOnly, context: SessionLayoutMode.EditorOnly, arrangement: SessionLayoutMode.Stacked, maximized: true, chatHidden: false },
+			afterShowChat: { mode: SessionLayoutMode.Stacked, context: SessionLayoutMode.Stacked, arrangement: SessionLayoutMode.Stacked, maximized: false, chatHidden: false },
+			// Only the user's own maximize and its restore.
+			maximizeCalls: [true, false],
+		});
+	});
+
+	test('in the center panel alignment, hiding the chat gives its room to the editor, not the panel, and showing it restores the sizes, also across a session switch', async () => {
+		const controller = createController('chat', sessionA);
+		await controller.whenRestored();
+		harness.partVisibility.set(Parts.PANEL_PART, true);
+		harness.panelAlignment = 'center';
+		const toggleChat = () => harness.instaService.invokeFunction(accessor => CommandsRegistry.getCommand(MAIN_WINDOW_LAYOUT_TOGGLE_COMMAND_IDS.chat)!.handler(accessor));
+		const sizes = () => ({ editor: harness.partSizes.get(Parts.EDITOR_PART), panel: harness.partSizes.get(Parts.PANEL_PART) });
+		const setSizes = (editor: [number, number], chat: [number, number], panel: [number, number]) => {
+			harness.partSizes.set(Parts.EDITOR_PART, { width: editor[0], height: editor[1] });
+			harness.partSizes.set(Parts.SESSIONS_PART, { width: chat[0], height: chat[1] });
+			harness.partSizes.set(Parts.PANEL_PART, { width: panel[0], height: panel[1] });
+		};
+
+		// Stacked: the column of the editor, the chat and the panel.
+		controller.layoutMode.setMode(SessionLayoutMode.Stacked);
+		setSizes([916, 113], [916, 336], [916, 184]);
+		await toggleChat();
+		const stackedHidden = sizes();
+		await toggleChat();
+		const stackedShown = sizes();
+
+		// Side by side: the column of the chat and the panel, beside the editor.
+		controller.layoutMode.setMode(SessionLayoutMode.SideBySide);
+		setSizes([300, 752], [612, 336], [612, 410]);
+		await toggleChat();
+		const sideBySideHidden = sizes();
+		// Round trip through a chat that shows its chat, and back to the one remembered with it hidden.
+		await focus(controller, sessionB);
+		const otherSession = sizes();
+		await focus(controller, sessionA);
+		const backHidden = { ...sizes(), mode: state(controller).mode };
+		// The session switched back to keeps its panel as it left it.
+		const panelVisible = harness.partVisibility.get(Parts.PANEL_PART);
+		await toggleChat();
+		const sideBySideShown = { ...sizes(), chat: harness.partSizes.get(Parts.SESSIONS_PART) };
+
+		assert.deepStrictEqual({ stackedHidden, stackedShown, sideBySideHidden, otherSession, backHidden, panelVisible, sideBySideShown }, {
+			// The editor takes the chat's height; the panel keeps its own.
+			stackedHidden: { editor: { width: 916, height: 449 }, panel: { width: 916, height: 184 } },
+			stackedShown: { editor: { width: 916, height: 113 }, panel: { width: 916, height: 184 } },
+			// The panel's column narrows to its least width, and the editor widens by as much.
+			sideBySideHidden: { editor: { width: 592, height: 752 }, panel: { width: 320, height: 410 } },
+			// An unvisited chat keeps what the window shows.
+			otherSession: { editor: { width: 592, height: 752 }, panel: { width: 320, height: 410 } },
+			backHidden: { editor: { width: 592, height: 752 }, panel: { width: 320, height: 410 }, mode: SessionLayoutMode.EditorOnly },
+			panelVisible: false,
+			// The chat's column takes its width from before, also with its panel hidden since, and the editor beside it gives
+			// it (in the grid; see stackedChatColumnResize.test.ts), rather than the window's width being restored.
+			sideBySideShown: { editor: { width: 592, height: 752 }, panel: { width: 320, height: 410 }, chat: { width: 612, height: 336 } },
+		});
+	});
+
+	test('in the justify panel alignment, hiding the chat leaves the editor and the panel sizes to the grid', async () => {
+		const controller = createController('chat', sessionA);
+		await controller.whenRestored();
+		harness.partVisibility.set(Parts.PANEL_PART, true);
+		harness.partSizes.set(Parts.EDITOR_PART, { width: 300, height: 452 });
+		harness.partSizes.set(Parts.PANEL_PART, { width: 916, height: 297 });
+		await harness.instaService.invokeFunction(accessor => CommandsRegistry.getCommand(MAIN_WINDOW_LAYOUT_TOGGLE_COMMAND_IDS.chat)!.handler(accessor));
+
+		assert.deepStrictEqual({ editor: harness.partSizes.get(Parts.EDITOR_PART), panel: harness.partSizes.get(Parts.PANEL_PART) }, {
+			editor: { width: 300, height: 452 },
+			panel: { width: 916, height: 297 },
+		});
+	});
+
+	test('shows each mode through the existing side pane operations, editor only hiding only the chat', async () => {
 		const controller = createController('chat', sessionA);
 		await controller.whenRestored();
 		const steps: ReturnType<typeof state>[] = [];
@@ -212,16 +347,16 @@ suite('Sessions - DesktopLayoutModeCoordinator', () => {
 
 		assert.deepStrictEqual({ steps, toggleSidePaneCalls: harness.toggleSidePaneCalls, maximizeCalls: harness.setEditorMaximizedCalls, commands: harness.executedCommands }, {
 			steps: [
-				{ mode: SessionLayoutMode.ChatOnly, context: SessionLayoutMode.ChatOnly, arrangement: SessionLayoutMode.SideBySide, maximized: false },
-				{ mode: SessionLayoutMode.Stacked, context: SessionLayoutMode.Stacked, arrangement: SessionLayoutMode.Stacked, maximized: false },
-				{ mode: SessionLayoutMode.EditorOnly, context: SessionLayoutMode.EditorOnly, arrangement: SessionLayoutMode.Stacked, maximized: true },
-				{ mode: SessionLayoutMode.SideBySide, context: SessionLayoutMode.SideBySide, arrangement: SessionLayoutMode.SideBySide, maximized: false },
-				{ mode: SessionLayoutMode.SideBySide, context: SessionLayoutMode.SideBySide, arrangement: SessionLayoutMode.SideBySide, maximized: false },
+				{ mode: SessionLayoutMode.ChatOnly, context: SessionLayoutMode.ChatOnly, arrangement: SessionLayoutMode.SideBySide, maximized: false, chatHidden: false },
+				{ mode: SessionLayoutMode.Stacked, context: SessionLayoutMode.Stacked, arrangement: SessionLayoutMode.Stacked, maximized: false, chatHidden: false },
+				{ mode: SessionLayoutMode.EditorOnly, context: SessionLayoutMode.EditorOnly, arrangement: SessionLayoutMode.Stacked, maximized: false, chatHidden: true },
+				{ mode: SessionLayoutMode.SideBySide, context: SessionLayoutMode.SideBySide, arrangement: SessionLayoutMode.SideBySide, maximized: false, chatHidden: false },
+				{ mode: SessionLayoutMode.SideBySide, context: SessionLayoutMode.SideBySide, arrangement: SessionLayoutMode.SideBySide, maximized: false, chatHidden: false },
 			],
 			// Hiding for chat only and showing again for stacked.
 			toggleSidePaneCalls: 2,
-			// Maximized and restored directly, synchronously, rather than through their commands.
-			maximizeCalls: [true, false],
+			// Editor only hides the chat, without maximizing the editor area.
+			maximizeCalls: [],
 			commands: [],
 		});
 	});
@@ -241,7 +376,7 @@ suite('Sessions - DesktopLayoutModeCoordinator', () => {
 			rememberedA: harness.layoutModeService.getMainWindowMode({ sessionResource: sessionA.resource, chatResource: sessionA.resource }, LayoutModeOwnerKind.Existing)?.mode,
 			rememberedB: harness.layoutModeService.getMainWindowMode({ sessionResource: sessionB.resource, chatResource: sessionB.resource }, LayoutModeOwnerKind.Existing)?.mode,
 		}, {
-			whileSeveral: { mode: SessionLayoutMode.SideBySide, context: SessionLayoutMode.SideBySide, arrangement: SessionLayoutMode.SideBySide, maximized: false },
+			whileSeveral: { mode: SessionLayoutMode.SideBySide, context: SessionLayoutMode.SideBySide, arrangement: SessionLayoutMode.SideBySide, maximized: false, chatHidden: false },
 			rememberedA: SessionLayoutMode.Stacked,
 			rememberedB: undefined,
 		});
@@ -261,7 +396,7 @@ suite('Sessions - DesktopLayoutModeCoordinator', () => {
 		await focus(controller, sessionB);
 
 		assert.deepStrictEqual({ shown: state(controller), remembered: harness.layoutModeService.getMainWindowMode(ownerB, LayoutModeOwnerKind.Existing) }, {
-			shown: { mode: SessionLayoutMode.ChatOnly, context: SessionLayoutMode.ChatOnly, arrangement: SessionLayoutMode.Stacked, maximized: false },
+			shown: { mode: SessionLayoutMode.ChatOnly, context: SessionLayoutMode.ChatOnly, arrangement: SessionLayoutMode.Stacked, maximized: false, chatHidden: false },
 			remembered: { mode: SessionLayoutMode.ChatOnly, splitLayout: SessionLayoutMode.Stacked, inputOnly: true },
 		});
 	});
