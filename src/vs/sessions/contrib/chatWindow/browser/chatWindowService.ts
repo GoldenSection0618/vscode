@@ -10,10 +10,17 @@ import { autorun, derived, IObservable, ISettableObservable, observableFromEvent
 import { timeout } from '../../../../base/common/async.js';
 import { isEqual } from '../../../../base/common/resources.js';
 import { IContextKey, IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
+import { ChatWindowCards } from './chatWindowCards.js';
+import { IThemeService } from '../../../../platform/theme/common/themeService.js';
+import { IEditorGroupView } from '../../../../workbench/browser/parts/editor/editor.js';
+import { EmptyEditorGroupAddTab } from '../../../browser/parts/emptyEditorGroupAddTab.js';
 import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
 import { IStorageService } from '../../../../platform/storage/common/storage.js';
 import { IAuxiliaryWindowService } from '../../../../workbench/services/auxiliaryWindow/browser/auxiliaryWindowService.js';
-import { EditorsOrder } from '../../../../workbench/common/editor.js';
+import { EditorsOrder, GroupModelChangeKind } from '../../../../workbench/common/editor.js';
+import { EditorInput } from '../../../../workbench/common/editor/editorInput.js';
+import { completeTerminalReturn, decideTerminalRowMove, TerminalRowMoveAction } from './chatWindowTerminalRowPolicy.js';
+import { TerminalEditorInput } from '../../../../workbench/contrib/terminal/browser/terminalEditorInput.js';
 import { EditorPartFixedGroupsContext } from '../../../../workbench/common/contextkeys.js';
 import { GroupDirection, IEditorGroup, IEditorGroupsService, IEditorPart, IFloatingEditorPart } from '../../../../workbench/services/editor/common/editorGroupsService.js';
 import { IEditorResolverService } from '../../../../workbench/services/editor/common/editorResolverService.js';
@@ -21,10 +28,13 @@ import { IEditorService } from '../../../../workbench/services/editor/common/edi
 import { ITitleService } from '../../../../workbench/services/title/browser/titleService.js';
 import { Menus } from '../../../browser/menus.js';
 import { TitlebarPart } from '../../../browser/parts/titlebarPart.js';
-import { CHAT_WINDOW_TEXT_EDITOR, ChatWindowContext, ChatWindowDockableContext, ChatWindowDockedContext, ChatWindowDockedOpenContext, ChatWindowDockedResizedContext, ChatWindowEditorAreaEditorContext, ChatWindowHasEditorAreaContext, ChatWindowSessionHasWorkspaceContext, ChatWindowTerminalShownContext, ChatWindowEditorViewTypeContext, ChatWindowHasEditorContext, ChatWindowLayout, ChatWindowLayoutContext, ChatWindowSplitLayout, ChatWindowSplitLayoutContext, IChatWindow, IChatWindowContent, IChatWindowEditor, IChatWindowEditorArea, IChatWindowKind, IChatWindowOpenOptions, IChatWindowService, IChatWindowTerminalHost } from '../../../services/chatWindow/browser/chatWindowService.js';
+import { CHAT_WINDOW_TEXT_EDITOR, ChatWindowContext, ChatWindowDockableContext, ChatWindowDockedContext, ChatWindowDockedOpenContext, ChatWindowDockedResizedContext, ChatWindowEditorAreaEditorContext, ChatWindowEditorGroupContext, ChatWindowHasEditorAreaContext, ChatWindowSessionHasWorkspaceContext, ChatWindowTerminalShownContext, ChatWindowTerminalRowContext, ChatWindowEditorViewTypeContext, ChatWindowHasEditorContext, ChatWindowLayout, ChatWindowLayoutContext, ChatWindowSplitLayout, ChatWindowSplitLayoutContext, ChatWindowTerminalPosition, ChatWindowTerminalPositionContext, IChatWindow, IChatWindowContent, IChatWindowEditor, IChatWindowEditorArea, IChatWindowKind, IChatWindowOpenOptions, IChatWindowService, IChatWindowTerminalHost } from '../../../services/chatWindow/browser/chatWindowService.js';
 import { IActiveSession, ISessionsManagementService } from '../../../services/sessions/common/sessionsManagement.js';
 import { ISessionsService } from '../../../services/sessions/browser/sessionsService.js';
-import { InFlightOperations, IChatWindowOpening, openCleaningUpOnFailure } from './chatWindowOpening.js';
+import { InFlightOperations, IChatWindowOpening, ChatModelHold, openCleaningUpOnFailure } from './chatWindowOpening.js';
+import { IChatService } from '../../../../workbench/contrib/chat/common/chatService/chatService.js';
+import { URI } from '../../../../base/common/uri.js';
+import { ISessionsPartService } from '../../../services/sessions/browser/sessionsPartService.js';
 import { ISession } from '../../../services/sessions/common/session.js';
 import { ISessionEditorWorkingSetService } from '../../layout/common/sessionEditorWorkingSet.js';
 import { IWorkbenchLayoutService, Parts } from '../../../../workbench/services/layout/browser/layoutService.js';
@@ -107,6 +117,12 @@ class ChatWindow implements IChatWindow {
 
 	readonly terminalShown: IObservable<boolean> = derived(this, reader => !!this.state.terminalGroup.read(reader));
 
+	get terminalPosition(): IObservable<ChatWindowTerminalPosition> { return this.state.terminalPosition; }
+
+	setTerminalPosition(position: ChatWindowTerminalPosition): void {
+		this.state.setTerminalPosition(position);
+	}
+
 	setTerminalShown(shown: boolean, options?: { readonly focus?: boolean }): Promise<void> {
 		return this._service.setTerminalShown(this, shown, options?.focus ?? false);
 	}
@@ -187,6 +203,9 @@ export class ChatWindowService extends Disposable implements IChatWindowService 
 		@ISessionsService private readonly _sessionsService: ISessionsService,
 		@ISessionEditorWorkingSetService private readonly _editorWorkingSetService: ISessionEditorWorkingSetService,
 		@IWorkbenchLayoutService private readonly _layoutService: IWorkbenchLayoutService,
+		@IThemeService private readonly _themeService: IThemeService,
+		@IChatService private readonly _chatService: IChatService,
+		@ISessionsPartService private readonly _sessionsPartService: ISessionsPartService,
 	) {
 		super();
 
@@ -299,10 +318,14 @@ export class ChatWindowService extends Disposable implements IChatWindowService 
 		windowDisposables.add(autorun(reader => layoutContext.set(state.layout.read(reader))));
 		const splitLayoutContext = ChatWindowSplitLayoutContext.bindTo(windowContextKeyService);
 		windowDisposables.add(autorun(reader => splitLayoutContext.set(state.splitLayout.read(reader))));
+		const terminalPositionContext = ChatWindowTerminalPositionContext.bindTo(windowContextKeyService);
+		windowDisposables.add(autorun(reader => terminalPositionContext.set(state.terminalPosition.read(reader))));
 		// An editor area shows its editors in tabs, and stays when its last editor closes. Tabs show for the whole part.
+		// Double-clicking a tab must not maximize or expand a group: the window arranges its groups.
+		// Editor actions stay on every group, so that the terminal row keeps its New Terminal action while another group has focus.
 		windowDisposables.add(part.enforcePartOptions(content.editorArea
-			? { showTabs: 'multiple', closeEmptyGroups: false }
-			: { showTabs: 'none', showBreadcrumbs: false, editorActionsLocation: 'hidden' }));
+			? { showTabs: 'multiple', closeEmptyGroups: false, alwaysShowEditorActions: true, doubleClickTabToToggleEditorGroupSizes: 'off' }
+			: { showTabs: 'none', showBreadcrumbs: false, editorActionsLocation: 'hidden', doubleClickTabToToggleEditorGroupSizes: 'off' }));
 		// The chat shows as a chat view, not as an editor: no tab, lock or editor actions.
 		windowDisposables.add(part.hideGroupTitle(chatGroup));
 		chatGroup.lock(true);
@@ -310,9 +333,17 @@ export class ChatWindowService extends Disposable implements IChatWindowService 
 		const editorGroup = content.editor || content.editorArea ? part.addGroup(chatGroup, GroupDirection.UP) : undefined;
 		// One editor is kept in its group; an editor area takes the editors opened from the chat window.
 		editorGroup?.lock(!!content.editor);
+		const chatGroupRoot = (chatGroup as IEditorGroupView).element.closest<HTMLElement>('.monaco-workbench');
+		if (!docked && chatGroupRoot) {
+			// Standalone windows only: the docked part is one floating card. Follows Layout Density while the window is open.
+			windowDisposables.add(new ChatWindowCards(part, chatGroupRoot, this._themeService));
+		}
 		const window = new ChatWindow(state, part, chatGroup, editorGroup, content, sessionObs, this, close, resetSize);
 		windowDisposables.add(autorun(reader => editorViewTypeContext.set(window.content.read(reader).editor?.viewType ?? '')));
 		ChatWindowHasEditorAreaContext.bindTo(windowContextKeyService).set(!!content.editorArea);
+		if (content.editorArea && editorGroup) {
+			ChatWindowEditorGroupContext.bindTo(windowContextKeyService).set(editorGroup.id);
+		}
 		const terminalShownContext = ChatWindowTerminalShownContext.bindTo(windowContextKeyService);
 		windowDisposables.add(autorun(reader => terminalShownContext.set(window.terminalShown.read(reader))));
 		windowDisposables.add(toDisposable(() => this._terminalRows.get(window)?.dispose()));
@@ -320,6 +351,22 @@ export class ChatWindowService extends Disposable implements IChatWindowService 
 			// What extensions open in a numbered view column, such as `ViewColumn.One`, opens in its editor area while it is
 			// the active window, rather than in the main window.
 			windowDisposables.add(part.setViewColumnGroup(editorGroup));
+			// Terminals show in the terminal row only: one opened in the editor area, such as by a New Terminal action
+			// that targets the active group, moves to the row.
+			windowDisposables.add(editorGroup.onDidModelChange(e => {
+				if (e.kind === GroupModelChangeKind.EDITOR_OPEN && e.editor?.typeId === TerminalEditorInput.ID) {
+					// After the move that opened it completes: a terminal dragged out of the row is still closed in the row, and moving it
+					// back meanwhile would leave it in no group.
+					void timeout(0).then(() => {
+						if (!windowDisposables.isDisposed) {
+							return this._moveTerminalToRow(window, editorGroup, e.editor!);
+						}
+						return undefined;
+					});
+				}
+			}));
+			// Its empty editor area offers the same Add Tab actions as the main window's. The terminal row, which holds terminals only, does not.
+			windowDisposables.add(this._instantiationService.createInstance(EmptyEditorGroupAddTab, editorGroup as IEditorGroupView, Menus.SessionsEditorTabsBarAddTab, Menus.SessionsEmptyEditorGroupAddTab));
 			// What the Session Activity Bar of the chat window shows as checked, and offers, as it does for the main window.
 			const editorAreaEditorContext = ChatWindowEditorAreaEditorContext.bindTo(windowContextKeyService);
 			const activeEditor = observableFromEvent(this, editorGroup.onDidActiveEditorChange, () => editorGroup.activeEditorPane?.getId() ?? '');
@@ -343,6 +390,11 @@ export class ChatWindowService extends Disposable implements IChatWindowService 
 		}
 
 		// Taken out of the main window's grid once its editors moved along, which switching sessions there would close.
+		// The main window's view of the chat lets go of its model as the session leaves the grid: held, so that the window's view binds to it rather than loading the chat again.
+		const heldChat = windowDisposables.add(new ChatModelHold(resource => this._chatService.acquireExistingSession(resource, 'ChatWindow#move')));
+		heldChat.hold(this._chatToHold(session, content.chat), this._boundCheck(session));
+		this._heldChats.set(window, heldChat);
+		windowDisposables.add(toDisposable(() => this._heldChats.delete(window)));
 		const windowSession = this._sessionsService.showSessionInWindow(session, { chatResource: content.chat, activates: kind.activatesSession ?? true });
 		// What moved or opened is the editor area's now.
 		window.setContent({ ...content, chat: windowSession.scopedChatResource, editorArea: content.editorArea ? {} : undefined });
@@ -488,14 +540,35 @@ export class ChatWindowService extends Disposable implements IChatWindowService 
 				return;
 			}
 			const row = window.part.addGroup(window.chatGroup, GroupDirection.DOWN);
-			// Only its terminal shows there, as the panel shows it, without tabs.
+			// Only terminals show there, in tabs.
 			row.lock(true);
 			const store = new DisposableStore();
+			ChatWindowTerminalRowContext.bindTo(row.scopedContextKeyService).set(true);
 			this._terminalRows.set(window, store);
-			store.add(window.part.hideGroupTitle(row));
-			// Its terminal exited.
+			// A terminal dragged out of the row, such as onto a locked group that refuses it and so opens a window of its own, would
+			// otherwise be out of sight: it goes back once that move completes.
+			// The row empties while it does, which must not hide it: the terminal is on its way back.
+			let returningTerminals = 0;
+			store.add(row.onWillMoveEditor(e => {
+				if (decideTerminalRowMove(e.editor.typeId === TerminalEditorInput.ID, row.id, e.target) === TerminalRowMoveAction.ReturnToRow) {
+					returningTerminals++;
+					void timeout(0).then(() => {
+						const target = this._editorGroupsService.getGroup(e.target);
+						completeTerminalReturn({
+							isCurrent: () => !store.isDisposed && window.state.terminalGroup.get() === row,
+							canMove: () => !!target?.contains(e.editor) && !row.contains(e.editor),
+							move: () => target!.moveEditor(e.editor, row, { pinned: true }),
+							end: () => --returningTerminals,
+							rowIsEmpty: () => row.isEmpty,
+							isEmptying: () => this._emptyingTerminalRows.has(window),
+							hideRow: () => void this.setTerminalShown(window, false, false),
+						});
+					});
+				}
+			}));
+			// Its last terminal exited or closed.
 			store.add(row.onDidCloseEditor(() => {
-				if (row.isEmpty && !this._emptyingTerminalRows.has(window)) {
+				if (row.isEmpty && !returningTerminals && !this._emptyingTerminalRows.has(window)) {
 					void this.setTerminalShown(window, false, false);
 				}
 			}));
@@ -507,6 +580,16 @@ export class ChatWindowService extends Disposable implements IChatWindowService 
 			this._terminalRows.get(window)?.dispose();
 			this._terminalRows.delete(window);
 			window.part.removeGroup(group);
+		}
+	}
+
+	private async _moveTerminalToRow(window: ChatWindow, from: IEditorGroup, editor: EditorInput): Promise<void> {
+		if (!window.terminalGroup.get()) {
+			await this.setTerminalShown(window, true, false);
+		}
+		const row = window.terminalGroup.get();
+		if (row && row !== from && from.contains(editor)) {
+			from.moveEditor(editor, row, { pinned: true });
 		}
 	}
 
@@ -553,6 +636,10 @@ export class ChatWindowService extends Disposable implements IChatWindowService 
 				return;
 			}
 			const previous = window.session.get();
+			const held = this._heldChats.get(window);
+			if (held) {
+				held.hold(this._chatToHold(session, content.chat), this._boundCheck(session));
+			}
 			const windowSession = this._sessionsService.showSessionInWindow(session, { chatResource: content.chat, activates: window.kind.activatesSession ?? true });
 			window.setSession(windowSession);
 			replaced = true;
@@ -575,6 +662,30 @@ export class ChatWindowService extends Disposable implements IChatWindowService 
 		}
 	}
 
+
+	/** What each chat window holds on to while its view binds to the chat: the loaded model of the chat; see {@link ChatModelHold}. */
+	private readonly _heldChats = new Map<ChatWindow, ChatModelHold>();
+
+	/** The chat that moves, when it is given and the session has it: no other chat is held in its place. */
+	private _chatToHold(session: ISession, chat: URI | undefined): URI | undefined {
+		return chat && session.chats.get().find(candidate => isEqual(candidate.resource, chat))?.resource;
+	}
+
+	/** Whether the chat view of the window of `session` has bound to its model: it loaded, or showed that it was loading and is done. */
+	private _boundCheck(session: ISession): () => boolean {
+		let loading = false;
+		return () => {
+			const view = this._sessionsPartService.getSessionView(session.sessionId)?.primaryChatView.get();
+			if (!view) {
+				return false;
+			}
+			if (view.isLoadingTranscript.get()) {
+				loading = true;
+				return false;
+			}
+			return loading;
+		};
+	}
 
 	/** Brings `window` to the front with the group it shows. */
 	private async _reveal(window: ChatWindow): Promise<void> {
