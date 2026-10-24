@@ -38,6 +38,7 @@ import { IInstantiationService } from '../../../platform/instantiation/common/in
 import { ServiceCollection } from '../../../platform/instantiation/common/serviceCollection.js';
 import { IKeybindingService } from '../../../platform/keybinding/common/keybinding.js';
 import { Menus, SessionActivityBarGroup } from '../menus.js';
+import { getSessionLayoutButtonLabel } from '../sessionLayoutModeActions.js';
 import { AgentWorkbenchLayout, IAgentWorkbenchLayoutService } from '../workbench.js';
 import { AGENTS_CONTENT_HORIZONTAL_PADDING } from '../../common/layoutConstants.js';
 import { SESSION_ACTIVITY_BAR_SETTING } from '../../common/sessionConfig.js';
@@ -349,8 +350,10 @@ export class ChatViewSessionActivityBar extends Disposable {
 		this._register(this.registerDragListeners(dragHandle));
 
 		const phoneLayout = observableFromEvent(this, layoutService.onDidLayoutMainContainer, () => isPhoneLayout(layoutService));
-		// While the strip shows outside the chat, no chat of the window keeps room for it.
-		this.reservedWidth = derived(this, reader => activityBar.visible.read(reader) && !phoneLayout.read(reader) && !this.externalHost.read(reader)?.active.read(reader) ? ChatViewSessionActivityBar.RESERVED_WIDTH : 0);
+		// Also while the strip shows outside the chat, such as at the edge of the editor stacked above it: the chat keeps its
+		// right column empty, so that what floats at the corner of the window, such as the Chatpad launcher, does not
+		// cover the input's toolbar, and its content does not shift as the strip moves.
+		this.reservedWidth = derived(this, reader => activityBar.visible.read(reader) && !phoneLayout.read(reader) ? ChatViewSessionActivityBar.RESERVED_WIDTH : 0);
 
 		this._register(autorun(reader => {
 			activityBar.itemCount.read(reader);
@@ -732,6 +735,7 @@ class SessionActivityBarSubmenuViewItem extends ActionViewItem {
 		options: IActionViewItemOptions,
 		@IInstantiationService private readonly instantiationService: IInstantiationService,
 		@IKeybindingService private readonly keybindingService: IKeybindingService,
+		@IContextKeyService private readonly contextKeyService: IContextKeyService,
 	) {
 		super(undefined, submenuAction, options);
 	}
@@ -762,10 +766,9 @@ class SessionActivityBarSubmenuViewItem extends ActionViewItem {
 		super.onClick(event);
 	}
 
-	/** Names the checked entry, if any, such as the current layout mode: "Layout: Stacked". */
+	/** The Layout button names the layout mode of its window: "Layout: Stacked". */
 	protected override getTooltip(): string | undefined {
-		const checked = this.submenuAction.actions.find(action => action.checked);
-		return checked ? localize('sessionActivityBarSubmenuChecked', "{0}: {1}", this.submenuAction.label, checked.label) : super.getTooltip();
+		return this.submenuAction.item.submenu === Menus.SessionLayout ? getSessionLayoutButtonLabel(this.contextKeyService) : super.getTooltip();
 	}
 
 	protected override getClass(): string | undefined {
