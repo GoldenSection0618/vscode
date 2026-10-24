@@ -12,7 +12,7 @@ import { Codicon } from '../../../base/common/codicons.js';
 import { Emitter, Event } from '../../../base/common/event.js';
 import { DisposableStore, toDisposable } from '../../../base/common/lifecycle.js';
 import { toAction } from '../../../base/common/actions.js';
-import { derived, observableValue } from '../../../base/common/observable.js';
+import { constObservable, derived, observableValue } from '../../../base/common/observable.js';
 import { AnchorAlignment } from '../../../base/common/layout.js';
 import { ThemeIcon } from '../../../base/common/themables.js';
 import { IHoverDelegate } from '../../../base/browser/ui/hover/hoverDelegate.js';
@@ -29,7 +29,7 @@ import { IConfigurationChangeEvent, IConfigurationService } from '../../../platf
 import { TestConfigurationService } from '../../../platform/configuration/test/common/testConfigurationService.js';
 import { IContextMenuMenuDelegate, IContextMenuService, IContextViewService } from '../../../platform/contextview/browser/contextView.js';
 import { workbenchInstantiationService } from '../../../workbench/test/browser/workbenchTestServices.js';
-import { ChatViewSessionActivityBar, SessionActivityBar } from '../../browser/parts/sessionActivityBar.js';
+import { ChatViewSessionActivityBar, registerSessionActivityBarExternalHost, SessionActivityBar, SessionActivityBarHostOccupancy } from '../../browser/parts/sessionActivityBar.js';
 import { Menus, SessionActivityBarGroup } from '../../browser/menus.js';
 import { TogglePanelAction } from '../../../workbench/browser/parts/panel/panelActions.js';
 import { AgentWorkbenchLayout, IAgentWorkbenchLayoutService } from '../../browser/workbench.js';
@@ -46,7 +46,7 @@ interface ITestEntry {
 	readonly id: string;
 	readonly title: string;
 	readonly icon: ThemeIcon;
-	readonly submenu?: readonly { readonly id: string; readonly title: string }[];
+	readonly submenu?: readonly { readonly id: string; readonly title: string; readonly checked?: boolean }[];
 	/** The menu group, `navigation` by default. */
 	readonly group?: string;
 	/** Whether the entry is checked, as when the side pane shows its editor. */
@@ -117,7 +117,7 @@ suite('Sessions - Session Activity Bar', () => {
 							const group = entry.group ?? 'navigation';
 							groups.set(group, [...groups.get(group) ?? [], entry.submenu
 								? new SubmenuItemAction({ submenu: MenuId.for(entry.id), title: entry.title, icon: entry.icon }, undefined, entry.submenu.map(item =>
-									instantiationService.createInstance(MenuItemAction, { id: item.id, title: item.title }, undefined, options, undefined, undefined)))
+									createEntryAction({ ...item, icon: entry.icon }, options)))
 								: createEntryAction(entry, options)]);
 						}
 						return [...groups];
@@ -160,8 +160,8 @@ suite('Sessions - Session Activity Bar', () => {
 			root,
 			activityBar,
 			activityService,
-			createDocked: () => {
-				const host = append(root, $('.host'));
+			createDocked: (parent: HTMLElement = root) => {
+				const host = append(parent, $('.host'));
 				host.style.cssText = 'width: 800px; height: 600px;';
 				for (const [token, value] of [['spacing-size20', '2px'], ['spacing-size40', '4px'], ['spacing-size120', '12px'], ['spacing-size240', '24px'], ['strokeThickness', '1px']]) {
 					host.style.setProperty(`--vscode-${token}`, value);
@@ -691,6 +691,106 @@ suite('Sessions - Session Activity Bar', () => {
 		});
 	});
 
+	test('shows the strip of the active chat in an active external host, which no chat then reserves room for, and beside the chat otherwise', () => {
+		const { createDocked, setEnabled, root } = createActivityBar(store, [changes]);
+		const hostElement = append(root, $('.external-host'));
+		const active = observableValue('active', false);
+		const occupancy = new SessionActivityBarHostOccupancy();
+		store.add(registerSessionActivityBarExternalHost(root, { element: hostElement, active, height: constObservable(500), setOccupied: (occupant, value) => occupancy.set(occupant, value) }));
+		const first = createDocked();
+		const second = createDocked();
+		first.setActive(true);
+		second.setActive(false);
+		// Occupied while the shown strip is in it, empty while the strip is disabled.
+		const where = () => ({
+			first: first.element?.parentElement === hostElement ? 'host' : 'chat',
+			second: second.element?.parentElement === hostElement ? 'host' : 'chat',
+			reserved: [first.reservedWidth.get(), second.reservedWidth.get()],
+			occupied: occupancy.occupied.get(),
+		});
+
+		const inactiveHost = where();
+		active.set(true, undefined);
+		const activeHost = where();
+		setEnabled(false);
+		const disabled = occupancy.occupied.get();
+		setEnabled(true);
+		// Focus moves to the second chat.
+		first.setActive(false);
+		second.setActive(true);
+		const focusMoved = where();
+		active.set(false, undefined);
+		const hostGone = where();
+
+		assert.deepStrictEqual({ inactiveHost, activeHost, disabled, focusMoved, hostGone }, {
+			inactiveHost: { first: 'chat', second: 'chat', reserved: [ChatViewSessionActivityBar.RESERVED_WIDTH, ChatViewSessionActivityBar.RESERVED_WIDTH], occupied: false },
+			activeHost: { first: 'host', second: 'chat', reserved: [0, 0], occupied: true },
+			disabled: false,
+			focusMoved: { first: 'chat', second: 'host', reserved: [0, 0], occupied: true },
+			hostGone: { first: 'chat', second: 'chat', reserved: [ChatViewSessionActivityBar.RESERVED_WIDTH, ChatViewSessionActivityBar.RESERVED_WIDTH], occupied: false },
+		});
+	});
+
+	test('keeps the external host occupied while any strip is in it, whichever order strips enter and leave in', () => {
+		const { createDocked, root } = createActivityBar(store, [changes]);
+		const hostElement = append(root, $('.external-host'));
+		const occupancy = new SessionActivityBarHostOccupancy();
+		store.add(registerSessionActivityBarExternalHost(root, { element: hostElement, active: constObservable(true), height: constObservable(500), setOccupied: (occupant, value) => occupancy.set(occupant, value) }));
+		const first = createDocked();
+		const second = createDocked();
+		const third = createDocked();
+		const state = () => ({ occupied: occupancy.occupied.get(), inHost: [first, second, third].map(strip => strip.element?.parentElement === hostElement) });
+
+		first.setActive(true);
+		// The next chat is activated before the previous one is deactivated, as when it comes first in the iteration.
+		second.setActive(true);
+		first.setActive(false);
+		const activatedBeforeDeactivated = state();
+		third.setActive(true);
+		// The previous strip is disposed while the next one is already in the host.
+		second.dispose();
+		const disposedWhileOtherOccupies = state();
+		third.setActive(false);
+		const empty = state();
+
+		assert.deepStrictEqual({ activatedBeforeDeactivated, disposedWhileOtherOccupies, empty }, {
+			activatedBeforeDeactivated: { occupied: true, inHost: [false, true, false] },
+			disposedWhileOtherOccupies: { occupied: true, inHost: [false, false, true] },
+			empty: { occupied: false, inHost: [false, false, false] },
+		});
+	});
+
+	test('shows the strip of an active chat hidden with its part only in an active external host, and finds the host once the chat is attached', async () => {
+		const { createDocked, root } = createActivityBar(store, [changes]);
+		const hostElement = append(root, $('.external-host'));
+		const active = observableValue('active', false);
+		store.add(registerSessionActivityBarExternalHost(root, { element: hostElement, active, height: constObservable(500), setOccupied: () => { } }));
+		// Created detached, as a chat is while the Sessions Part is hidden and not laid out.
+		const detached = mainWindow.document.createElement('div');
+		const docked = createDocked(detached);
+		const where = () => docked.element?.parentElement === hostElement ? 'host' : docked.element?.classList.contains('inactive') ? 'hidden' : 'chat';
+
+		docked.setActive(true, true);
+		const hiddenWithPart = where();
+		active.set(true, undefined);
+		const hostActiveWhileDetached = where();
+		root.appendChild(detached);
+		await new Promise(resolve => mainWindow.requestAnimationFrame(resolve));
+		const attached = where();
+		active.set(false, undefined);
+		const hostInactive = where();
+		docked.setActive(true, false);
+		const partShown = where();
+
+		assert.deepStrictEqual({ hiddenWithPart, hostActiveWhileDetached, attached, hostInactive, partShown }, {
+			hiddenWithPart: 'hidden',
+			hostActiveWhileDetached: 'hidden',
+			attached: 'host',
+			hostInactive: 'hidden',
+			partShown: 'chat',
+		});
+	});
+
 	test('reserves room beside the chat whether or not the view is active, unless disabled or in the phone layout', () => {
 		const { createDocked, setEnabled, root, layoutMainContainer } = createActivityBar(store, [changes]);
 		const docked = createDocked();
@@ -788,6 +888,24 @@ suite('Sessions - Session Activity Bar', () => {
 		assert.deepStrictEqual({ before, ran }, {
 			before: { files: { checked: true, pressed: 'true' }, browser: { checked: false, pressed: null }, terminal: { checked: true, pressed: 'true' } },
 			ran: [TOGGLE_SIDE_PANEL_COMMAND_ID, 'test.browser', TogglePanelAction.ID, TOGGLE_SIDE_PANEL_COMMAND_ID],
+		});
+	});
+
+	test('names a submenu entry after its checked item, such as the Layout button after the current mode, keeping its icon', () => {
+		const layout = (checked: string): ITestEntry => ({
+			id: 'test.layout', title: 'Layout', icon: Codicon.layout,
+			submenu: ['Chat Only', 'Editor Only', 'Stacked', 'Side by Side'].map(title => ({ id: `test.layout.${title}`, title, checked: title === checked })),
+		});
+		const describe = (entries: ITestEntry[]) => {
+			const { activityBar } = createActivityBar(store, entries);
+			const button = activityBar.element.querySelector<HTMLElement>('.action-label[aria-haspopup="menu"]')!;
+			return { label: button.getAttribute('aria-label'), icon: button.classList.contains('codicon-layout') };
+		};
+
+		assert.deepStrictEqual({ stacked: describe([layout('Stacked')]), editorOnly: describe([layout('Editor Only')]), noneChecked: describe([canvas]) }, {
+			stacked: { label: 'Layout: Stacked', icon: true },
+			editorOnly: { label: 'Layout: Editor Only', icon: true },
+			noneChecked: { label: 'Canvas', icon: false },
 		});
 	});
 
